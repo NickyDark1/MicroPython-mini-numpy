@@ -1,0 +1,721 @@
+from array import array
+import micropython
+import math
+
+# --- Funciones Viper para operaciones element-wise sobre arrays 1D ---
+
+@micropython.viper
+def vector_add(a: ptr32, b: ptr32, c: ptr32, n: int):
+    i: int = 0
+    while i < n:
+        c[i] = a[i] + b[i]
+        i += 1
+
+@micropython.viper
+def vector_sub(a: ptr32, b: ptr32, c: ptr32, n: int):
+    i: int = 0
+    while i < n:
+        c[i] = a[i] - b[i]
+        i += 1
+
+@micropython.viper
+def vector_mul(a: ptr32, b: ptr32, c: ptr32, n: int):
+    i: int = 0
+    while i < n:
+        c[i] = a[i] * b[i]
+        i += 1
+
+@micropython.viper
+def vector_div(a: ptr32, b: ptr32, c: ptr32, n: int):
+    i: int = 0
+    while i < n:
+        # División entera; si b[i]==0 se asigna 0
+        c[i] = a[i] // b[i] if b[i] != 0 else 0
+        i += 1
+
+# --- Funciones Viper para reducciones ---
+
+@micropython.viper
+def viper_sum(a: ptr32, n: int) -> int:
+    s: int = 0
+    i: int = 0
+    while i < n:
+        s += a[i]
+        i += 1
+    return s
+
+@micropython.viper
+def viper_min(a: ptr32, n: int) -> int:
+    m: int = a[0]
+    i: int = 1
+    while i < n:
+        if a[i] < m:
+            m = a[i]
+        i += 1
+    return m
+
+@micropython.viper
+def viper_max(a: ptr32, n: int) -> int:
+    m: int = a[0]
+    i: int = 1
+    while i < n:
+        if a[i] > m:
+            m = a[i]
+        i += 1
+    return m
+
+@micropython.viper
+def viper_prod(a: ptr32, n: int) -> int:
+    p: int = 1
+    i: int = 0
+    while i < n:
+        p *= a[i]
+        i += 1
+    return p
+
+# --- Clase MiniArray extendida ---
+class MiniArray:
+    def __init__(self, data, shape=None, typecode='i'):
+        """
+        data: iterable o array del módulo array.
+        shape: tupla que indica la forma; si no se proporciona se asume 1D.
+        typecode: 'i' para enteros, 'f' para flotantes.
+                  (Esta implementación se centra en 'i' y 'f'.)
+        """
+        if isinstance(data, array):
+            self.data = data
+        else:
+            self.data = array(typecode, data)
+        self.typecode = typecode
+        if shape:
+            total = 1
+            for dim in shape:
+                total *= dim
+            if total != len(self.data):
+                raise ValueError("El producto de las dimensiones debe coincidir con el número de elementos")
+            self._shape = shape
+        else:
+            self._shape = (len(self.data),)
+    
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def size(self):
+        return len(self.data)
+    
+    def _compute_strides(self):
+        # Calcula los strides para indexación en arrays multidimensionales.
+        strides = []
+        acc = 1
+        for dim in reversed(self._shape):
+            strides.insert(0, acc)
+            acc *= dim
+        return tuple(strides)
+    
+    def _flat_index(self, idx_tuple):
+        """
+        Convierte una tupla de índices en la posición lineal.
+        Se asume indexación completa (sin slices).
+        """
+        if not isinstance(idx_tuple, tuple):
+            idx_tuple = (idx_tuple,)
+        if len(idx_tuple) != len(self._shape):
+            raise IndexError("Número incorrecto de índices")
+        strides = self._compute_strides()
+        offset = 0
+        for idx, dim, stride in zip(idx_tuple, self._shape, strides):
+            if idx < 0 or idx >= dim:
+                raise IndexError("Índice fuera de rango")
+            offset += idx * stride
+        return offset
+
+    def __getitem__(self, key):
+        # Para simplificar, los slices en multidimensional se implementan solo en 1D.
+        if isinstance(key, tuple):
+            offset = self._flat_index(key)
+            return self.data[offset]
+        elif isinstance(key, slice):
+            return MiniArray(self.data[key], shape=(len(self.data[key]),), typecode=self.typecode)
+        elif isinstance(key, int):
+            if key < 0:
+                key += self.size
+            return self.data[key]
+        else:
+            raise IndexError("Tipo de índice no soportado")
+    
+    def __setitem__(self, key, value):
+        if isinstance(key, tuple):
+            offset = self._flat_index(key)
+            self.data[offset] = value
+        elif isinstance(key, int):
+            if key < 0:
+                key += self.size
+            self.data[key] = value
+        else:
+            raise IndexError("Tipo de índice no soportado")
+    
+    def reshape(self, new_shape):
+        total = 1
+        for dim in new_shape:
+            total *= dim
+        if total != self.size:
+            raise ValueError("El tamaño total no coincide")
+        self._shape = new_shape
+        return self
+
+    def flatten(self):
+        return MiniArray(self.data, shape=(self.size,), typecode=self.typecode)
+
+    def transpose(self):
+        # Solo para arrays 2D
+        if len(self._shape) != 2:
+            raise ValueError("Transposición solo soportada para arrays 2D")
+        rows, cols = self._shape
+        new_data = array(self.typecode, [0] * self.size)
+        for i in range(rows):
+            for j in range(cols):
+                new_data[j * rows + i] = self[i, j]
+        return MiniArray(new_data, shape=(cols, rows), typecode=self.typecode)
+    
+    # --- Operadores unarios ---
+    def __neg__(self):
+        result = array(self.typecode, [-x for x in self.data])
+        return MiniArray(result, shape=self._shape, typecode=self.typecode)
+    
+    def __pos__(self):
+        # Operador unario '+' (retorna la misma matriz)
+        return self
+
+    # --- Métodos de reducción usando Viper ---
+    def sum(self):
+        return viper_sum(self.data, self.size)
+    
+    def min(self):
+        if self.size == 0:
+            raise ValueError("Array vacío")
+        return viper_min(self.data, self.size)
+    
+    def max(self):
+        if self.size == 0:
+            raise ValueError("Array vacío")
+        return viper_max(self.data, self.size)
+    
+    def prod(self):
+        return viper_prod(self.data, self.size)
+    
+    def mean(self):
+        return self.sum() / self.size
+
+    def all(self):
+        # Retorna True si todos los elementos son "verdaderos" (distintos de 0)
+        i = 0
+        while i < self.size:
+            if not self.data[i]:
+                return False
+            i += 1
+        return True
+
+    def any(self):
+        # Retorna True si alguno de los elementos es "verdadero"
+        i = 0
+        while i < self.size:
+            if self.data[i]:
+                return True
+            i += 1
+        return False
+
+    # --- Métodos element-wise: mínimo y máximo entre arrays ---
+    def minimum(self, other):
+        # Devuelve un nuevo MiniArray con el mínimo elemento a elemento
+        if not isinstance(other, MiniArray) or self.size != other.size:
+            raise ValueError("Los arrays deben tener el mismo tamaño")
+        result = array(self.typecode, [0] * self.size)
+        i = 0
+        while i < self.size:
+            result[i] = self.data[i] if self.data[i] < other.data[i] else other.data[i]
+            i += 1
+        return MiniArray(result, shape=self._shape, typecode=self.typecode)
+    
+    def maximum(self, other):
+        # Devuelve un nuevo MiniArray con el máximo elemento a elemento
+        if not isinstance(other, MiniArray) or self.size != other.size:
+            raise ValueError("Los arrays deben tener el mismo tamaño")
+        result = array(self.typecode, [0] * self.size)
+        i = 0
+        while i < self.size:
+            result[i] = self.data[i] if self.data[i] > other.data[i] else other.data[i]
+            i += 1
+        return MiniArray(result, shape=self._shape, typecode=self.typecode)
+    
+    # --- Operadores element-wise (binarios) ---
+    def __add__(self, other):
+        if isinstance(other, MiniArray):
+            if self.size != other.size:
+                raise ValueError("Los arrays deben tener el mismo número de elementos")
+            result = array(self.typecode, [0] * self.size)
+            vector_add(self.data, other.data, result, self.size)
+            return MiniArray(result, shape=self._shape, typecode=self.typecode)
+        elif isinstance(other, (int, float)):
+            result = array(self.typecode, [x + other for x in self.data])
+            return MiniArray(result, shape=self._shape, typecode=self.typecode)
+        else:
+            return NotImplemented
+
+    def __sub__(self, other):
+        if isinstance(other, MiniArray):
+            if self.size != other.size:
+                raise ValueError("Los arrays deben tener el mismo número de elementos")
+            result = array(self.typecode, [0] * self.size)
+            vector_sub(self.data, other.data, result, self.size)
+            return MiniArray(result, shape=self._shape, typecode=self.typecode)
+        elif isinstance(other, (int, float)):
+            result = array(self.typecode, [x - other for x in self.data])
+            return MiniArray(result, shape=self._shape, typecode=self.typecode)
+        else:
+            return NotImplemented
+
+    def __mul__(self, other):
+        if isinstance(other, MiniArray):
+            if self.size != other.size:
+                raise ValueError("Los arrays deben tener el mismo número de elementos")
+            result = array(self.typecode, [0] * self.size)
+            vector_mul(self.data, other.data, result, self.size)
+            return MiniArray(result, shape=self._shape, typecode=self.typecode)
+        elif isinstance(other, (int, float)):
+            result = array(self.typecode, [x * other for x in self.data])
+            return MiniArray(result, shape=self._shape, typecode=self.typecode)
+        else:
+            return NotImplemented
+
+    def __truediv__(self, other):
+        if isinstance(other, MiniArray):
+            if self.size != other.size:
+                raise ValueError("Los arrays deben tener el mismo número de elementos")
+            result = array(self.typecode, [0] * self.size)
+            vector_div(self.data, other.data, result, self.size)
+            return MiniArray(result, shape=self._shape, typecode=self.typecode)
+        elif isinstance(other, (int, float)):
+            if other == 0:
+                raise ZeroDivisionError("División por cero")
+            result = array(self.typecode, [x / other for x in self.data])
+            return MiniArray(result, shape=self._shape, typecode=self.typecode)
+        else:
+            return NotImplemented
+
+    def __pow__(self, other):
+        if isinstance(other, (int, float)):
+            result = array(self.typecode, [x ** other for x in self.data])
+            return MiniArray(result, shape=self._shape, typecode=self.typecode)
+        else:
+            return NotImplemented
+
+    # --- Ufuncs element-wise simples: método genérico para aplicar una función de math ---
+    def apply_func(self, func):
+        # Aplica la función func a cada elemento y devuelve un MiniArray de floats
+        result = array('f', [0.0] * self.size)
+        i = 0
+        while i < self.size:
+            result[i] = func(float(self.data[i]))
+            i += 1
+        return MiniArray(result, shape=self._shape, typecode='f')
+    
+    def sin(self):
+        return self.apply_func(math.sin)
+    
+    def cos(self):
+        return self.apply_func(math.cos)
+    
+    def tan(self):
+        return self.apply_func(math.tan)
+    
+    def acos(self):
+        return self.apply_func(math.acos)
+    
+    def asin(self):
+        return self.apply_func(math.asin)
+    
+    def atan(self):
+        return self.apply_func(math.atan)
+    
+    def ceil(self):
+        return self.apply_func(math.ceil)
+    
+    def floor(self):
+        return self.apply_func(math.floor)
+    
+    def log(self):
+        return self.apply_func(math.log)
+    
+    def log10(self):
+        return self.apply_func(math.log10)
+    
+    def log2(self):
+        return self.apply_func(math.log2)
+    
+    def sqrt(self):
+        return self.apply_func(math.sqrt)
+    
+    # Otros ufuncs como exp, expm1, gamma, lgamma, erf, etc. se pueden agregar de forma similar.
+    def exp(self):
+        return self.apply_func(math.exp)
+    
+    # --- Álgebra lineal (para arrays 2D) ---
+    def dot(self, other):
+        if len(self._shape) != 2 and len(other._shape) != 2:
+            # Si son 1D, se aplica producto punto
+            if self.size != other.size:
+                raise ValueError("Los arrays deben tener el mismo número de elementos")
+            return (self * other).sum()
+        else:
+            # Producto matricial simple (sin optimización)
+            # Se asume self de forma (m, n) y other de forma (n, p)
+            if len(self._shape) != 2 or len(other._shape) != 2:
+                raise ValueError("Producto dot para matrices requiere arrays 2D")
+            m, n = self._shape
+            n2, p = other._shape
+            if n != n2:
+                raise ValueError("Dimensiones incompatibles para dot")
+            new_data = []
+            for i in range(m):
+                for j in range(p):
+                    s = 0
+                    for k in range(n):
+                        s += self[i, k] * other[k, j]
+                    new_data.append(s)
+            return MiniArray(new_data, shape=(m, p), typecode=self.typecode)
+    
+    def det(self):
+        # Determinante para matrices 2x2 o 3x3 de forma sencilla
+        if len(self._shape) != 2 or self._shape[0] != self._shape[1]:
+            raise ValueError("Determinante solo para matrices cuadradas")
+        n = self._shape[0]
+        if n == 2:
+            a, b, c, d = self.data[0], self.data[1], self.data[2], self.data[3]
+            return a * d - b * c
+        elif n == 3:
+            a, b, c, d, e, f, g, h, i = self.data[0], self.data[1], self.data[2], self.data[3], self.data[4], self.data[5], self.data[6], self.data[7], self.data[8]
+            return a*(e*i - f*h) - b*(d*i - f*g) + c*(d*h - e*g)
+        else:
+            # Método básico por eliminación gaussiana para n > 3 (no optimizado)
+            mat = [list(self.data[i*self._shape[0]:(i+1)*self._shape[0]]) for i in range(n)]
+            det_val = 1
+            for i in range(n):
+                # Buscar pivote
+                pivot = mat[i][i]
+                if pivot == 0:
+                    for j in range(i+1, n):
+                        if mat[j][i] != 0:
+                            mat[i], mat[j] = mat[j], mat[i]
+                            det_val *= -1
+                            pivot = mat[i][i]
+                            break
+                    else:
+                        return 0
+                det_val *= pivot
+                for j in range(i+1, n):
+                    factor = mat[j][i] / pivot
+                    for k in range(i, n):
+                        mat[j][k] -= factor * mat[i][k]
+            return det_val
+
+    def inv(self):
+        # Inversa para matrices cuadradas (método de Gauss-Jordan, no optimizado)
+        if len(self._shape) != 2 or self._shape[0] != self._shape[1]:
+            raise ValueError("Inversa solo para matrices cuadradas")
+        n = self._shape[0]
+        # Crear matriz aumentada [A | I]
+        A = [list(self.data[i*n:(i+1)*n]) for i in range(n)]
+        I = [[1 if i==j else 0 for j in range(n)] for i in range(n)]
+        for i in range(n):
+            # Buscar pivote
+            pivot = A[i][i]
+            if pivot == 0:
+                for j in range(i+1, n):
+                    if A[j][i] != 0:
+                        A[i], A[j] = A[j], A[i]
+                        I[i], I[j] = I[j], I[i]
+                        pivot = A[i][i]
+                        break
+                else:
+                    raise ValueError("Matriz singular, no se puede invertir")
+            # Normalizar fila i
+            for j in range(n):
+                A[i][j] /= pivot
+                I[i][j] /= pivot
+            # Eliminar otros elementos en columna i
+            for k in range(n):
+                if k != i:
+                    factor = A[k][i]
+                    for j in range(n):
+                        A[k][j] -= factor * A[i][j]
+                        I[k][j] -= factor * I[i][j]
+        inv_data = []
+        for row in I:
+            inv_data.extend(row)
+        return MiniArray(inv_data, shape=(n, n), typecode='f')
+    
+    def solve(self, b):
+        # Resuelve el sistema Ax = b para A (self) y b (MiniArray 1D o 2D columna)
+        if len(self._shape) != 2:
+            raise ValueError("A debe ser una matriz 2D")
+        n, m = self._shape
+        if n != m:
+            raise ValueError("A debe ser cuadrada")
+        if isinstance(b, MiniArray) and len(b.shape) == 1:
+            # Convertir a matriz columna
+            b = b.reshape((n, 1))
+        if b.shape[0] != n:
+            raise ValueError("Dimensiones incompatibles")
+        # Usar la inversa para resolver: x = A^-1 * b
+        A_inv = self.inv()
+        return A_inv.dot(b)
+    
+    # --- Funciones de volteo ---
+    def flip(self, axis=None):
+        # Devuelve un nuevo MiniArray con los elementos invertidos a lo largo de 'axis'
+        # Si axis es None, invierte el array aplanado
+        if axis is None:
+            new_data = list(reversed(self.data))
+            return MiniArray(new_data, shape=self._shape, typecode=self.typecode)
+        elif axis < 0 or axis >= len(self._shape):
+            raise ValueError("Axis fuera de rango")
+        # Para arrays multidimensionales, se reconstruye el array volteando el eje indicado.
+        # Esta es una implementación simplificada.
+        new_list = [None] * self.size
+        strides = self._compute_strides()
+        dims = self._shape
+        for index in range(self.size):
+            # Convertir índice plano a índices múltiples
+            idx = []
+            rem = index
+            for s, d in zip(strides, dims):
+                idx.append(rem // s)
+                rem = rem % s
+            # Voltear en el eje indicado
+            idx[axis] = dims[axis] - 1 - idx[axis]
+            # Convertir de nuevo a índice plano
+            new_index = 0
+            for i, s in zip(idx, strides):
+                new_index += i * s
+            new_list[new_index] = self.data[index]
+        return MiniArray(new_list, shape=self._shape, typecode=self.typecode)
+    
+    def fliplr(self):
+        # Voltea el array horizontalmente (para 2D, eje 1)
+        if len(self._shape) < 2:
+            raise ValueError("fliplr requiere un array de al menos 2D")
+        return self.flip(axis=1)
+    
+    def flipud(self):
+        # Voltea el array verticalmente (para 2D, eje 0)
+        if len(self._shape) < 2:
+            raise ValueError("flipud requiere un array de al menos 2D")
+        return self.flip(axis=0)
+    
+    def median(self):
+        # Convertir los datos a una lista y ordenarlos.
+        sorted_list = sorted(self.data)
+        mid = self.size // 2
+        if self.size % 2 == 0:
+            return (sorted_list[mid - 1] + sorted_list[mid]) / 2
+        else:
+            return sorted_list[mid]
+    
+    def mask(self, bool_array):
+        """
+        Retorna un nuevo MiniArray con los elementos de self donde
+        los correspondientes en bool_array son verdaderos (distintos de 0).
+        Se asume que bool_array es un MiniArray de tipo 'i' con valores 0 o 1.
+        """
+        if self.size != bool_array.size:
+            raise ValueError("El array de máscara debe tener el mismo tamaño")
+        result_list = []
+        i = 0
+        while i < self.size:
+            if bool_array.data[i]:
+                result_list.append(self.data[i])
+            i += 1
+        return MiniArray(result_list, shape=(len(result_list),), typecode=self.typecode)
+
+    
+    def var(self):
+        m = self.mean()
+        s = 0
+        i = 0
+        while i < self.size:
+            diff = self.data[i] - m
+            s += diff * diff
+            i += 1
+        return s / self.size
+    
+    def std(self):
+        return math.sqrt(self.var())
+
+    
+    # --- Funciones de apilado ---
+    @staticmethod
+    def concatenate(arrays, axis=0):
+        # Soporta concatenación para arrays 1D o 2D simples
+        if not arrays:
+            raise ValueError("No se proporcionaron arrays")
+        # Para axis 0: apilar filas (vertical)  
+        # Para axis 1: apilar columnas (horizontal)
+        base_shape = arrays[0].shape
+        typecode = arrays[0].typecode
+        if axis == 0:
+            # Todas deben tener la misma cantidad de columnas (si son 2D) o ser 1D
+            new_data = []
+            new_rows = 0
+            for arr in arrays:
+                if len(arr.shape) > 1 and arr.shape[1] != base_shape[1]:
+                    raise ValueError("Arrays incompatibles para concatenar verticalmente")
+                new_data.extend(arr.data)
+                new_rows += arr.shape[0]
+            if len(base_shape) > 1:
+                new_shape = (new_rows, base_shape[1])
+            else:
+                new_shape = (new_rows,)
+            return MiniArray(new_data, shape=new_shape, typecode=typecode)
+        elif axis == 1:
+            # Para concatenar horizontalmente, todos deben tener el mismo número de filas
+            if len(base_shape) < 2:
+                raise ValueError("Concatenación horizontal requiere arrays 2D")
+            rows = base_shape[0]
+            new_data = []
+            new_cols = 0
+            for arr in arrays:
+                if arr.shape[0] != rows:
+                    raise ValueError("Arrays incompatibles para concatenar horizontalmente")
+                new_cols += arr.shape[1]
+            # Reconstruir la matriz fila a fila
+            for i in range(rows):
+                for arr in arrays:
+                    row_start = i * arr.shape[1]
+                    row_end = row_start + arr.shape[1]
+                    new_data.extend(arr.data[row_start:row_end])
+            new_shape = (rows, new_cols)
+            return MiniArray(new_data, shape=new_shape, typecode=typecode)
+        else:
+            raise ValueError("Axis no soportado para concatenate")
+    
+    @staticmethod
+    def vstack(arrays):
+        # Vertical stack: equivalente a concatenate(axis=0)
+        return MiniArray.concatenate(arrays, axis=0)
+    
+    @staticmethod
+    def hstack(arrays):
+        # Horizontal stack: equivalente a concatenate(axis=1)
+        return MiniArray.concatenate(arrays, axis=1)
+    
+    def __repr__(self):
+        return "MiniArray(" + str(list(self.data)) + ", shape=" + str(self._shape) + ")"
+
+# --- Funciones de creación de arrays ---
+def empty(shape, typecode='f'):
+    total = 1
+    for dim in shape:
+        total *= dim
+    return MiniArray([0] * total, shape=shape, typecode=typecode)
+
+def full(shape, fill_value, typecode='f'):
+    total = 1
+    for dim in shape:
+        total *= dim
+    return MiniArray([fill_value] * total, shape=shape, typecode=typecode)
+
+def zeros(shape, typecode='f'):
+    return full(shape, 0, typecode)
+
+def ones(shape, typecode='f'):
+    return full(shape, 1, typecode)
+
+def eye(n, typecode='f'):
+    # Matriz identidad de n x n
+    result = [0] * (n * n)
+    for i in range(n):
+        result[i * n + i] = 1
+    return MiniArray(result, shape=(n, n), typecode=typecode)
+
+# --- Ejemplo de uso extendido ---
+if __name__ == '__main__':
+    # Arrays 1D de enteros
+    a = MiniArray([1, 2, 3, 4])
+    b = MiniArray([10, 20, 30, 40])
+    print("a:", a)
+    print("b:", b)
+    print("a + b:", a + b)
+    print("a - b:", a - b)
+    print("a * b:", a * b)
+    print("b / a:", b / a)
+    print("a ** 2:", a ** 2)
+    print("-a:", -a)
+    print("+a:", +a)
+    print("Suma de a:", a.sum())
+    print("Prod de a:", a.prod())
+    print("Mínimo de b:", b.min())
+    print("Máximo de b:", b.max())
+    print("Media de a:", a.mean())
+    print("All de a (todos != 0):", a.all())
+    print("Any de a (alguno != 0):", a.any())
+    
+    # Estadísticas avanzadas
+    print("Varianza de a:", a.var())
+    print("Desviación estándar de a:", a.std())
+    print("Mediana de a:", a.median())
+    print("Percentil 75 de b:", b.percentile(75) if hasattr(b, 'percentile') else "No implementado")
+    
+    # Dot product
+    print("Producto punto de a y b:", a.dot(b))
+    
+    # Indexación y slicing en 1D
+    print("a[2]:", a[2])
+    print("a[1:3]:", a[1:3])
+    
+    # Boolean indexing (mask)
+    mask_arr = MiniArray([1, 0, 1, 0])
+    print("Elementos de a con mask:", a.mask(mask_arr))
+    
+    # Arrays 2D y operaciones de apilado
+    data_2d = [1, 2, 3, 4, 5, 6]
+    c = MiniArray(data_2d, shape=(2, 3))
+    print("c:", c)
+    print("Elemento c[1,2]:", c[1, 2])
+    c[0, 1] = 99
+    print("c tras asignar c[0,1]=99:", c)
+    print("c transpuesta:", c.transpose())
+    d = ones((2,3), typecode='i')
+    e = zeros((2,3), typecode='i')
+    print("vstack de c y c:", MiniArray.vstack([c, c]))
+    print("hstack de c y c:", MiniArray.hstack([c, c]))
+    
+    # Creación de arrays especiales
+    print("empty (2,2):", empty((2,2)))
+    print("full (2,2) con 7:", full((2,2), 7))
+    print("zeros (2,2):", zeros((2,2)))
+    print("ones (2,2):", ones((2,2)))
+    print("eye (3):", eye(3))
+    
+    # Flip functions
+    print("c flip:", c.flip())
+    print("c fliplr:", c.fliplr())
+    print("c flipud:", c.flipud())
+    
+    # Ufuncs: aplicar funciones matemáticas
+    f = MiniArray([0, math.pi/2, math.pi], typecode='f')
+    print("f:", f)
+    print("sin(f):", f.sin())
+    print("cos(f):", f.cos())
+    print("tan(f):", f.tan())
+    print("sqrt(f):", f.sqrt())
+    
+    # Álgebra lineal: inv, det, solve (para matrices 2D pequeñas)
+    A = MiniArray([4, 7, 2, 6], shape=(2,2), typecode='f')
+    print("A:", A)
+    print("det(A):", A.det())
+    print("inv(A):", A.inv())
+    b_vec = MiniArray([1, 0], typecode='f')
+    print("Solución de A x = b:", A.solve(b_vec))
+
